@@ -1,5 +1,5 @@
 """
-Assignment 11 — Monitoring & Alerts starter (TODO).
+Assignment 11 — Monitoring & Alerts (block rate, rate-limit hits, judge fails).
 
 Tracks block rate, rate-limit hits, judge fail rate.
 Fires alerts when thresholds are exceeded.
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -42,16 +43,69 @@ class MonitoringAlert:
     judge_fails: int = 0
 
     def check_metrics(self) -> list[Alert]:
-        """TODO: compute rates, append Alert objects when thresholds exceeded."""
-        raise NotImplementedError("Implement MonitoringAlert.check_metrics")
+        """Compute rates, append Alert objects when thresholds exceeded."""
+        # Tính lại từ đầu mỗi lần gọi, nếu không alert sẽ nhân bản sau mỗi lần check.
+        self.alerts.clear()
+
+        if self.total_requests:
+            block_rate = self.blocked_requests / self.total_requests
+            if block_rate >= self.block_rate_threshold:
+                self.alerts.append(
+                    Alert(
+                        metric="block_rate",
+                        value=round(block_rate, 4),
+                        threshold=self.block_rate_threshold,
+                        message=(
+                            f"Block rate {block_rate:.0%} ≥ "
+                            f"{self.block_rate_threshold:.0%} — kiểm tra tấn công "
+                            "hoặc false positive."
+                        ),
+                    )
+                )
+
+        if self.rate_limit_hits >= self.rate_limit_hit_threshold:
+            self.alerts.append(
+                Alert(
+                    metric="rate_limit_hits",
+                    value=float(self.rate_limit_hits),
+                    threshold=float(self.rate_limit_hit_threshold),
+                    message=(
+                        f"{self.rate_limit_hits} request bị chặn bởi rate limiter "
+                        "— nghi flood / cost attack."
+                    ),
+                )
+            )
+
+        if self.judge_checks:
+            judge_fail_rate = self.judge_fails / self.judge_checks
+            if judge_fail_rate >= self.judge_fail_rate_threshold:
+                self.alerts.append(
+                    Alert(
+                        metric="judge_fail_rate",
+                        value=round(judge_fail_rate, 4),
+                        threshold=self.judge_fail_rate_threshold,
+                        message=(
+                            f"Judge fail rate {judge_fail_rate:.0%} ≥ "
+                            f"{self.judge_fail_rate_threshold:.0%} — output "
+                            "guardrails đang phải can thiệp nhiều."
+                        ),
+                    )
+                )
+
+        return list(self.alerts)
 
     def export_json(self, filepath: str | None = None):
-        """TODO: write metrics + alerts to JSON under repo-root ``outputs/`` by default.
-        Use ``filepath or default_metrics_path()`` so running from ``src/`` does not
-        create ``src/outputs/``.
-        """
-        _ = filepath or default_metrics_path()
-        raise NotImplementedError("Implement MonitoringAlert.export_json")
+        """Write metrics + alerts to JSON under repo-root ``outputs/`` by default."""
+        path = Path(filepath or default_metrics_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            **self.snapshot(),
+        }
+        path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        return str(path)
 
     def snapshot(self) -> dict:
         block_rate = (
