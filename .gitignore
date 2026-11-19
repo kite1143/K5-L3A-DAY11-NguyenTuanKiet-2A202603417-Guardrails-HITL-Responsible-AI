@@ -134,6 +134,9 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# Local scratch (pip/temp files under this repo)
+.tmp/
+
 # Environments
 .env
 .envrc
