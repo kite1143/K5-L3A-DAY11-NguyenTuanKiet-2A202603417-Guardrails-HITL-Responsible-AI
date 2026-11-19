@@ -13,6 +13,35 @@ from google.adk import runners
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
+from core.config import DEMO_SECRETS
+
+# Nhãn issue khớp ``pii_cases[*].expect_issue_types`` trong
+# data/pii_hallucination_samples.json: phone, email, national_id, api_key, password.
+# Thứ tự quan trọng: secret dài/specific chạy trước để không bị pattern ngắn
+# cắt mất một phần (vd. sk-… chứa "key").
+PII_PATTERNS: list[tuple[str, str]] = [
+    # API key: sk-vinbank-secret-2024, sk-demo-key-abc123
+    ("api_key", r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{5,}"),
+    # password is admin123 · password=admin123 · mật khẩu: …
+    (
+        "password",
+        r"(?:password|passwd|pwd|mật\s*khẩu|mat\s*khau)\s*(?:is|are|=|:|：)\s*[^\s,;]+",
+    ),
+    # test@vinbank.com, lan.nguyen@example.com
+    ("email", r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
+    # SĐT VN: 0901234567, 02838223344, 0 901 234 567, +84901234567.
+    # (?!\d) để 12 số CCCD không bị cắt oan thành "phone".
+    ("phone", r"(?<!\d)(?:\+84|0)[\s.\-]?\d{9,10}(?!\d)"),
+    # CCCD 12 số đứng một mình (079204001234).
+    ("national_id", r"(?<!\d)\d{12}(?!\d)"),
+]
+
+# CMND 9 số quá dễ trùng số tiền (500000000) -> chỉ bắt khi có từ khoá đi kèm.
+NATIONAL_ID_9_KEYWORD_RE = re.compile(
+    r"((?:cccd|cmnd|cmt|can\s*cuoc|căn\s*cước|hộ\s*chiếu|ho\s*chieu|passport|"
+    r"giấy\s*tờ|giay\s*to|id)\D{0,12})(\d{9})(?!\d)",
+    re.IGNORECASE,
+)
 
 
 # ============================================================
@@ -36,24 +65,33 @@ def content_filter(response: str) -> dict:
     Returns:
         dict with 'safe', 'issues', and 'redacted' keys
     """
-    issues = []
-    redacted = response
+    issues: list[str] = []
+    # Chạy tuần tự trên chuỗi đã redact: secret bị che ở lớp trước không bị
+    # đếm hai lần ở lớp sau (tránh issue "secret" thừa bên cạnh "password").
+    redacted = response or ""
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+    for name, pattern in PII_PATTERNS:
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # CMND 9 số — giữ lại từ khoá, chỉ che phần số.
+    id9_matches = NATIONAL_ID_9_KEYWORD_RE.findall(redacted)
+    if id9_matches:
+        issues.append(f"national_id: {len(id9_matches)} found")
+        redacted = NATIONAL_ID_9_KEYWORD_RE.sub(r"\1[REDACTED]", redacted)
+
+    # Secret nhúng sẵn của lab (admin123, sk-vinbank-secret-2024,
+    # db.vinbank.internal…). Chạy sau cùng để không trùng nhãn với pattern trên.
+    for needle in DEMO_SECRETS:
+        if not needle:
+            continue
+        # Nuốt luôn ":5432" sau host để không sót cổng DB.
+        pattern = re.compile(re.escape(needle) + r"(?::\d+)?", re.IGNORECASE)
+        if pattern.search(redacted):
+            issues.append("secret: internal value found")
+            redacted = pattern.sub("[REDACTED]", redacted)
 
     return {
         "safe": len(issues) == 0,
@@ -149,6 +187,9 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        # CP3 đọc hai field này để điền ``layer`` / lý do trong results.json.
+        self.last_layer: str | None = None
+        self.last_issues: list[str] = []
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -172,16 +213,36 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Redact PII / secret. Câu trả lời vẫn hữu ích sau khi che.
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            self.last_layer = "output_redaction"
+            self.last_issues = list(result["issues"])
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=result["redacted"])],
+            )
 
-        return llm_response  # TODO: modify if needed
+        # 2. Judge (optional — chỉ chạy khi safety_judge_agent đã được tạo).
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(result["redacted"])
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                self.last_layer = "output_judge"
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text=(
+                                "I can't share that response. Please ask about "
+                                "VinBank accounts, transfers, savings, loans or cards."
+                            )
+                        )
+                    ],
+                )
+
+        return llm_response
 
 
 # ============================================================
